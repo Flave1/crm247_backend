@@ -161,6 +161,17 @@ input {
   padding: 10px 12px;
 }
 
+textarea {
+  width: 100%;
+  min-width: 0;
+  resize: vertical;
+  border: 1px solid #cbd5e1;
+  border-radius: 7px;
+  font: inherit;
+  line-height: 1.5;
+  padding: 10px 12px;
+}
+
 pre {
   max-height: 210px;
   overflow: auto;
@@ -175,6 +186,11 @@ pre {
 .error {
   margin-top: 10px !important;
   color: #b91c1c !important;
+}
+
+.success {
+  margin-top: 10px !important;
+  color: #047857 !important;
 }
 
 .table-panel {
@@ -289,6 +305,26 @@ th {
 
 .compact-list {
   margin-top: 14px;
+}
+
+.email-panel {
+  min-height: 360px;
+}
+
+.email-form {
+  display: grid;
+  gap: 10px;
+  margin-top: 16px;
+}
+
+.email-form label {
+  color: #334155;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.email-form button {
+  justify-self: start;
 }
 
 @media (max-width: 900px) {

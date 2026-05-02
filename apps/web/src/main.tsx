@@ -51,6 +51,7 @@ interface ContactRow {
 interface ContactActivity {
   summary: {
     websiteEventCount: number;
+    emailEventCount: number;
     visitorCount: number;
     topPages: Array<{ pageUrl: string; pageTitle?: string | null; count: number }>;
   };
@@ -58,21 +59,50 @@ interface ContactActivity {
     id: string;
     source: string;
     type: string;
-    pageUrl: string;
+    pageUrl?: string | null;
     pageTitle?: string | null;
+    subject?: string | null;
+    targetUrl?: string | null;
     timestamp: string;
   }>;
+}
+
+interface EmailMessageRow {
+  _id?: string;
+  trackingId: string;
+  to: string;
+  subject: string;
+  status: string;
+  openCount?: number;
+  clickCount?: number;
+  createdAt: string;
+}
+
+interface EmailEventRow {
+  _id?: string;
+  trackingId: string;
+  eventType: string;
+  subject?: string;
+  targetUrl?: string | null;
+  timestamp: string;
 }
 
 function App() {
   const [trackerState, setTrackerState] = useState<Record<string, unknown> | null>(null);
   const [email, setEmail] = useState("demo@crm247.local");
+  const [emailSubject, setEmailSubject] = useState("Still interested in Atlas Agent Console?");
+  const [emailHtml, setEmailHtml] = useState(
+    '<h1>Quick follow up</h1><p>You looked interested in the Atlas Agent Console.</p><p><a href="https://www.mongodb.com/products/platform/atlas-database">Review Atlas</a></p>'
+  );
   const [visitors, setVisitors] = useState<VisitorRow[]>([]);
   const [events, setEvents] = useState<EventRow[]>([]);
   const [contacts, setContacts] = useState<ContactRow[]>([]);
+  const [messages, setMessages] = useState<EmailMessageRow[]>([]);
+  const [emailEvents, setEmailEvents] = useState<EmailEventRow[]>([]);
   const [selectedContactId, setSelectedContactId] = useState<string | null>(null);
   const [contactActivity, setContactActivity] = useState<ContactActivity | null>(null);
   const [apiError, setApiError] = useState<string | null>(null);
+  const [emailStatus, setEmailStatus] = useState<string | null>(null);
 
   const refreshTrackerState = () => {
     setTrackerState(window.CRM247?.getState() || null);
@@ -81,19 +111,25 @@ function App() {
   const refreshData = async () => {
     try {
       setApiError(null);
-      const [visitorsRes, eventsRes, contactsRes] = await Promise.all([
+      const [visitorsRes, eventsRes, contactsRes, messagesRes, emailEventsRes] = await Promise.all([
         fetch(`${API_ORIGIN}/track/visitors?domainId=${encodeURIComponent(DEMO_DOMAIN_ID)}`),
         fetch(`${API_ORIGIN}/track/events?domainId=${encodeURIComponent(DEMO_DOMAIN_ID)}`),
-        fetch(`${API_ORIGIN}/contacts?domainId=${encodeURIComponent(DEMO_DOMAIN_ID)}`)
+        fetch(`${API_ORIGIN}/contacts?domainId=${encodeURIComponent(DEMO_DOMAIN_ID)}`),
+        fetch(`${API_ORIGIN}/emails/messages?domainId=${encodeURIComponent(DEMO_DOMAIN_ID)}`),
+        fetch(`${API_ORIGIN}/emails/events?domainId=${encodeURIComponent(DEMO_DOMAIN_ID)}`)
       ]);
-      if (!visitorsRes.ok || !eventsRes.ok || !contactsRes.ok) {
+      if (!visitorsRes.ok || !eventsRes.ok || !contactsRes.ok || !messagesRes.ok || !emailEventsRes.ok) {
         throw new Error("Tracking API is not ready yet.");
       }
       const visitorsJson = await visitorsRes.json();
       const eventsJson = await eventsRes.json();
       const contactsJson = await contactsRes.json();
+      const messagesJson = await messagesRes.json();
+      const emailEventsJson = await emailEventsRes.json();
       setVisitors(visitorsJson.visitors || []);
       setEvents(eventsJson.events || []);
+      setMessages(messagesJson.messages || []);
+      setEmailEvents(emailEventsJson.events || []);
       const nextContacts = contactsJson.contacts || [];
       setContacts(nextContacts);
       setSelectedContactId((current) => current || nextContacts[0]?.id || null);
@@ -162,6 +198,40 @@ function App() {
     window.setTimeout(() => void refreshData(), 800);
   };
 
+  const handleSendEmail = async (event: FormEvent) => {
+    event.preventDefault();
+    setEmailStatus(null);
+    const targetEmail = email.trim();
+    if (!targetEmail || !emailSubject.trim() || !emailHtml.trim()) return;
+
+    const response = await fetch(`${API_ORIGIN}/emails/send`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        domainId: DEMO_DOMAIN_ID,
+        contactId: selectedContactId,
+        to: targetEmail,
+        subject: emailSubject.trim(),
+        html: emailHtml,
+        metadata: {
+          source: "dashboard_demo",
+          autonomyMode: "manual"
+        }
+      })
+    });
+
+    if (!response.ok) {
+      setEmailStatus("Email send failed.");
+      return;
+    }
+
+    const json = await response.json();
+    setEmailStatus(`Tracked email created: ${json.message.trackingId}`);
+    await refreshData();
+    await loadContactActivity(json.message.contactId || selectedContactId);
+    if (json.message.contactId) setSelectedContactId(json.message.contactId);
+  };
+
   return (
     <main className="shell">
       <section className="hero">
@@ -174,8 +244,8 @@ function App() {
           </p>
         </div>
         <div className="status">
-          <span>Phase 2</span>
-          <strong>Cookie tracking</strong>
+          <span>Phase 4</span>
+          <strong>Email tracking</strong>
           <small>{trackerState ? "Tracker loaded" : "Waiting for tracker"}</small>
         </div>
       </section>
@@ -351,6 +421,7 @@ function App() {
             <>
               <div className="summary-strip">
                 <span>{contactActivity.summary.websiteEventCount} events</span>
+                <span>{contactActivity.summary.emailEventCount} email signals</span>
                 <span>{contactActivity.summary.visitorCount} visitor ids</span>
               </div>
               <div className="top-pages">
@@ -368,14 +439,88 @@ function App() {
               <div className="event-list compact-list">
                 {contactActivity.timeline.slice(0, 10).map((event) => (
                   <div className="event-row" key={event.id}>
-                    <strong>{event.type}</strong>
+                    <strong>{event.source}:{event.type}</strong>
                     <span>{new Date(event.timestamp).toLocaleTimeString()}</span>
-                    <small>{event.pageTitle || event.pageUrl}</small>
+                    <small>{event.subject || event.pageTitle || event.targetUrl || event.pageUrl}</small>
                   </div>
                 ))}
               </div>
             </>
           )}
+        </article>
+
+        <article className="panel email-panel">
+          <h2>Tracked Email Sender</h2>
+          <p>
+            Creates an outbound message, rewrites links through crm247, and injects
+            a one pixel open tracker.
+          </p>
+          <form className="email-form" onSubmit={handleSendEmail}>
+            <label htmlFor="email-subject">Subject</label>
+            <input
+              id="email-subject"
+              value={emailSubject}
+              onChange={(event) => setEmailSubject(event.target.value)}
+            />
+            <label htmlFor="email-html">HTML</label>
+            <textarea
+              id="email-html"
+              value={emailHtml}
+              onChange={(event) => setEmailHtml(event.target.value)}
+              rows={7}
+            />
+            <button type="submit">Create tracked email</button>
+            {emailStatus && <p className="success">{emailStatus}</p>}
+          </form>
+        </article>
+
+        <article className="panel table-panel">
+          <h2>Email Messages</h2>
+          <div className="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Recipient</th>
+                  <th>Subject</th>
+                  <th>Opens</th>
+                  <th>Clicks</th>
+                </tr>
+              </thead>
+              <tbody>
+                {messages.length === 0 ? (
+                  <tr>
+                    <td colSpan={4}>No tracked emails yet.</td>
+                  </tr>
+                ) : (
+                  messages.slice(0, 8).map((message) => (
+                    <tr key={message._id || message.trackingId}>
+                      <td>{message.to}</td>
+                      <td>{message.subject}</td>
+                      <td>{message.openCount || 0}</td>
+                      <td>{message.clickCount || 0}</td>
+                    </tr>
+                  ))
+                )}
+              </tbody>
+            </table>
+          </div>
+        </article>
+
+        <article className="panel table-panel">
+          <h2>Email Events</h2>
+          <div className="event-list">
+            {emailEvents.length === 0 ? (
+              <p>No email events yet.</p>
+            ) : (
+              emailEvents.slice(0, 12).map((event) => (
+                <div className="event-row" key={event._id || `${event.trackingId}-${event.timestamp}`}>
+                  <strong>{event.eventType}</strong>
+                  <span>{new Date(event.timestamp).toLocaleTimeString()}</span>
+                  <small>{event.subject || event.targetUrl || event.trackingId}</small>
+                </div>
+              ))
+            )}
+          </div>
         </article>
       </section>
     </main>

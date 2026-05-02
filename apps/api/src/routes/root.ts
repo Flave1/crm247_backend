@@ -6,7 +6,7 @@ rootRouter.get("/", (_req, res) => {
   res.json({
     name: "crm247",
     description: "Multi-agent autonomous engagement platform",
-    phase: "2-cookie-tracking",
+    phase: "4-email-tracking",
     endpoints: {
       health: "/health",
       roadmap: [
@@ -18,8 +18,11 @@ rootRouter.get("/", (_req, res) => {
         "GET /track/events",
         "GET /contacts",
         "GET /contacts/:contactId/activity",
-        "/email/open/:trackingId",
-        "/email/click/:trackingId",
+        "POST /emails/send",
+        "GET /emails/messages",
+        "GET /emails/events",
+        "GET /email/open/:trackingId",
+        "GET /email/click/:trackingId",
         "/engagement/runs"
       ]
     }

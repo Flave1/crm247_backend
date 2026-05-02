@@ -47,8 +47,12 @@ Implemented:
 - batched website event ingestion
 - visitor identify endpoint
 - contacts API and contact activity timeline
+- email send endpoint with tracking pixel injection
+- email click redirect endpoint with link tracking
+- email event feed and outbound message records
 - demo UI that loads and exercises the tracker
 - demo UI for identified contacts and linked website activity
+- demo UI for creating and inspecting tracked emails
 
 ## Local Setup
 
@@ -83,9 +87,11 @@ npm run dev:web
 3. Events are batched into MongoDB Atlas through `/track/events/batch`.
 4. Visitor is identified when email is captured through `/track/identify`.
 5. Contacts can be listed and inspected through `/contacts`.
-6. Email open/click events are recorded in a later phase.
-7. LangGraph agents analyze signals and create engagement queue items in a later phase.
-8. Dashboard shows queue, message draft, policy decision, and agent trace in a later phase.
+6. Dashboard creates a tracked email through `/emails/send`.
+7. Email opens hit `/email/open/:trackingId.gif`.
+8. Email clicks redirect through `/email/click/:trackingId`.
+9. LangGraph agents analyze signals and create engagement queue items in a later phase.
+10. Dashboard shows queue, message draft, policy decision, and agent trace in a later phase.
 
 ## Phase 2 Endpoints
 
@@ -100,4 +106,9 @@ GET  /contacts
 GET  /contacts/:contactId
 PATCH /contacts/:contactId
 GET  /contacts/:contactId/activity
+POST /emails/send
+GET  /emails/messages
+GET  /emails/events
+GET  /email/open/:trackingId.gif
+GET  /email/click/:trackingId
 ```

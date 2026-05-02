@@ -62,13 +62,19 @@ MongoDB collections:
 
 Goal: track outbound email engagement.
 
-Build:
+Status: **implemented**
+
+Built:
 
 - `POST /emails/send`
 - `GET /email/open/:trackingId`
 - `GET /email/click/:trackingId`
 - link rewriting
 - tracking pixel injection
+- `GET /emails/messages`
+- `GET /emails/events`
+- dashboard tracked email sender
+- email activity merged into contact timeline
 
 MongoDB collections:
 

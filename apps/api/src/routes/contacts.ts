@@ -158,6 +158,13 @@ contactsRouter.get("/contacts/:contactId/activity", async (req, res) => {
     .limit(200)
     .toArray();
 
+  const emailEvents = await db
+    .collection("email_events")
+    .find({ domainId: contact.domainId, contactId })
+    .sort({ timestamp: -1 })
+    .limit(100)
+    .toArray();
+
   const pageCounts = new Map<string, { pageUrl: string; pageTitle: string | null; count: number }>();
   for (const event of websiteEvents) {
     if (event.eventType !== "page_view") continue;
@@ -172,17 +179,34 @@ contactsRouter.get("/contacts/:contactId/activity", async (req, res) => {
     pageCounts.set(key, existing);
   }
 
-  const timeline = websiteEvents.map((event) => ({
-    id: event._id?.toString(),
-    source: "website",
-    type: event.eventType,
-    visitorId: event.visitorId,
-    sessionId: event.sessionId || null,
-    pageUrl: event.pageUrl,
-    pageTitle: event.pageTitle || null,
-    metadata: event.metadata || {},
-    timestamp: event.timestamp
-  }));
+  const timeline = [
+    ...websiteEvents.map((event) => ({
+      id: event._id?.toString(),
+      source: "website",
+      type: event.eventType,
+      visitorId: event.visitorId,
+      sessionId: event.sessionId || null,
+      pageUrl: event.pageUrl,
+      pageTitle: event.pageTitle || null,
+      subject: null,
+      targetUrl: null,
+      metadata: event.metadata || {},
+      timestamp: event.timestamp
+    })),
+    ...emailEvents.map((event) => ({
+      id: event._id?.toString(),
+      source: "email",
+      type: event.eventType,
+      visitorId: null,
+      sessionId: null,
+      pageUrl: null,
+      pageTitle: null,
+      subject: event.subject || null,
+      targetUrl: event.targetUrl || null,
+      metadata: event.metadata || {},
+      timestamp: event.timestamp
+    }))
+  ].sort((a, b) => String(b.timestamp).localeCompare(String(a.timestamp)));
 
   res.json({
     ok: true,
@@ -198,10 +222,10 @@ contactsRouter.get("/contacts/:contactId/activity", async (req, res) => {
     })),
     summary: {
       websiteEventCount: websiteEvents.length,
+      emailEventCount: emailEvents.length,
       visitorCount: visitors.length,
       topPages: Array.from(pageCounts.values()).sort((a, b) => b.count - a.count).slice(0, 5)
     },
     timeline
   });
 });
-

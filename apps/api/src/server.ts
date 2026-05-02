@@ -6,6 +6,7 @@ import { ensureIndexes } from "./db/indexes.js";
 import { healthRouter } from "./routes/health.js";
 import { rootRouter } from "./routes/root.js";
 import { contactsRouter } from "./routes/contacts.js";
+import { emailsRouter } from "./routes/emails.js";
 import { trackingRouter } from "./routes/tracking.js";
 
 const app = express();
@@ -30,6 +31,7 @@ app.use("/", rootRouter);
 app.use("/health", healthRouter);
 app.use("/", trackingRouter);
 app.use("/", contactsRouter);
+app.use("/", emailsRouter);
 
 async function start() {
   const db = await getMongoDb();
