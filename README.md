@@ -24,7 +24,7 @@ MongoDB Atlas is used as:
 ```txt
 crm247/
   apps/
-    api/          Express + TypeScript backend
+    api/          FastAPI + Python backend
     web/          Vite + React frontend shell
   docs/
     BUILD_PHASES.md
@@ -53,6 +53,9 @@ Implemented:
 - demo UI that loads and exercises the tracker
 - demo UI for identified contacts and linked website activity
 - demo UI for creating and inspecting tracked emails
+- phase 5 engagement runs with Aurray-shaped run, queue, and decision trace records
+- deterministic LangGraph-style orchestration for one contact per run
+- in-app escalation records for approval or policy-held queue items, with Slack/Teams/SMS placeholders reserved
 
 ## Local Setup
 
@@ -62,10 +65,16 @@ Copy the env example:
 cp .env.example .env
 ```
 
-Install dependencies:
+Install frontend dependencies:
 
 ```bash
 npm install
+```
+
+Install backend dependencies:
+
+```bash
+python3 -m pip install -r apps/api/requirements.txt
 ```
 
 Run backend:
@@ -91,7 +100,7 @@ npm run dev:web
 7. Email opens hit `/email/open/:trackingId.gif`.
 8. Email clicks redirect through `/email/click/:trackingId`.
 9. LangGraph agents analyze signals and create engagement queue items in a later phase.
-10. Dashboard shows queue, message draft, policy decision, and agent trace in a later phase.
+10. Dashboard can now inspect run queue items, policy decisions, and decision traces through the Phase 5 APIs.
 
 ## Phase 2 Endpoints
 
@@ -111,4 +120,17 @@ GET  /emails/messages
 GET  /emails/events
 GET  /email/open/:trackingId.gif
 GET  /email/click/:trackingId
+POST /engagement/runs
+GET  /engagement/runs
+GET  /engagement/runs/:runId
+PATCH /engagement/runs/:runId
+GET  /engagement/runs/:runId/queue
+GET  /engagement/runs/:runId/queue/:queueItemId
+POST /engagement/runs/:runId/queue/:queueItemId/approve
+POST /engagement/runs/:runId/queue/:queueItemId/pause
+POST /engagement/runs/:runId/queue/:queueItemId/generate-message
+PUT  /engagement/runs/:runId/queue/:queueItemId/message
+GET  /engagement/runs/:runId/decision-traces
+GET  /engagement/runs/:runId/graph
+GET  /engagement/runs/:runId/notifications
 ```
