@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { Router } from "express";
+import { ObjectId } from "mongodb";
 import { z } from "zod";
 import { getMongoDb } from "../db/mongo.js";
 import { buildTrackerScript } from "../tracker/script.js";
@@ -79,6 +80,7 @@ async function upsertContact(params: {
   domainId: string;
   email: string;
   properties?: Record<string, unknown>;
+  pageUrl?: string | null;
 }) {
   const db = await getMongoDb();
   const timestamp = nowIso();
@@ -96,7 +98,9 @@ async function upsertContact(params: {
         properties: params.properties || {}
       },
       $set: {
-        updatedAt: timestamp
+        updatedAt: timestamp,
+        lastWebsiteVisitAt: timestamp,
+        ...(params.pageUrl ? { lastWebsitePageUrl: params.pageUrl } : {})
       }
     },
     { upsert: true, returnDocument: "after" }
@@ -109,12 +113,14 @@ async function linkVisitorToContact(params: {
   visitorId: string;
   email: string;
   properties?: Record<string, unknown>;
+  pageUrl?: string | null;
 }) {
   const db = await getMongoDb();
   const contact = await upsertContact({
     domainId: params.domainId,
     email: params.email,
-    properties: params.properties
+    properties: params.properties,
+    pageUrl: params.pageUrl
   });
   const contactId = contact?._id?.toString();
   await db.collection("visitors").updateOne(
@@ -188,7 +194,8 @@ trackingRouter.post("/track/visitor", async (req, res) => {
       domainId: body.domainId,
       visitorId,
       email,
-      properties: body.properties
+      properties: body.properties,
+      pageUrl: body.pageUrl
     });
     contactId = linked.contactId;
   }
@@ -283,7 +290,8 @@ trackingRouter.post("/track/events/batch", async (req, res) => {
           domainId: event.domainId,
           visitorId: event.visitorId,
           email,
-          properties: event.metadata
+          properties: event.metadata,
+          pageUrl: event.pageUrl
         });
         visitor = {
           ...visitor,
@@ -323,6 +331,37 @@ trackingRouter.post("/track/events/batch", async (req, res) => {
       { domainId: event.domainId, visitorId: event.visitorId },
       update
     );
+
+    if (visitor?.contactId) {
+      const contactSet: Record<string, unknown> = {
+        updatedAt: createdAt,
+        lastWebsiteVisitAt: timestamp,
+        lastWebsitePageUrl: event.pageUrl,
+        lastWebsitePageTitle: event.pageTitle || null
+      };
+      const contactInc: Record<string, number> = {};
+      if (event.eventType === "page_view") contactInc.pageViewCount = 1;
+      if (event.eventType === "time_on_page") contactInc.totalActiveMs = activeMsDelta(event.metadata);
+      if (event.sessionId && !knownSessions.includes(event.sessionId)) contactInc.sessionCount = 1;
+
+      if (typeof visitor.contactId === "string" && ObjectId.isValid(visitor.contactId)) {
+        await db.collection("contacts").updateOne(
+          { _id: new ObjectId(visitor.contactId), domainId: event.domainId },
+          {
+            $set: contactSet,
+            ...(Object.keys(contactInc).length > 0 ? { $inc: contactInc } : {})
+          }
+        );
+      } else if (visitor.email) {
+        await db.collection("contacts").updateOne(
+          { domainId: event.domainId, email: visitor.email },
+          {
+            $set: contactSet,
+            ...(Object.keys(contactInc).length > 0 ? { $inc: contactInc } : {})
+          }
+        );
+      }
+    }
 
     docs.push({
       domainId: event.domainId,

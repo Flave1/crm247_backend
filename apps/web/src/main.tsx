@@ -36,11 +36,42 @@ interface EventRow {
   metadata?: Record<string, unknown>;
 }
 
+interface ContactRow {
+  id: string;
+  domainId: string;
+  email: string;
+  firstName?: string | null;
+  lastName?: string | null;
+  company?: string | null;
+  pageViewCount?: number;
+  sessionCount?: number;
+  lastWebsiteVisitAt?: string | null;
+}
+
+interface ContactActivity {
+  summary: {
+    websiteEventCount: number;
+    visitorCount: number;
+    topPages: Array<{ pageUrl: string; pageTitle?: string | null; count: number }>;
+  };
+  timeline: Array<{
+    id: string;
+    source: string;
+    type: string;
+    pageUrl: string;
+    pageTitle?: string | null;
+    timestamp: string;
+  }>;
+}
+
 function App() {
   const [trackerState, setTrackerState] = useState<Record<string, unknown> | null>(null);
   const [email, setEmail] = useState("demo@crm247.local");
   const [visitors, setVisitors] = useState<VisitorRow[]>([]);
   const [events, setEvents] = useState<EventRow[]>([]);
+  const [contacts, setContacts] = useState<ContactRow[]>([]);
+  const [selectedContactId, setSelectedContactId] = useState<string | null>(null);
+  const [contactActivity, setContactActivity] = useState<ContactActivity | null>(null);
   const [apiError, setApiError] = useState<string | null>(null);
 
   const refreshTrackerState = () => {
@@ -50,20 +81,43 @@ function App() {
   const refreshData = async () => {
     try {
       setApiError(null);
-      const [visitorsRes, eventsRes] = await Promise.all([
+      const [visitorsRes, eventsRes, contactsRes] = await Promise.all([
         fetch(`${API_ORIGIN}/track/visitors?domainId=${encodeURIComponent(DEMO_DOMAIN_ID)}`),
-        fetch(`${API_ORIGIN}/track/events?domainId=${encodeURIComponent(DEMO_DOMAIN_ID)}`)
+        fetch(`${API_ORIGIN}/track/events?domainId=${encodeURIComponent(DEMO_DOMAIN_ID)}`),
+        fetch(`${API_ORIGIN}/contacts?domainId=${encodeURIComponent(DEMO_DOMAIN_ID)}`)
       ]);
-      if (!visitorsRes.ok || !eventsRes.ok) {
+      if (!visitorsRes.ok || !eventsRes.ok || !contactsRes.ok) {
         throw new Error("Tracking API is not ready yet.");
       }
       const visitorsJson = await visitorsRes.json();
       const eventsJson = await eventsRes.json();
+      const contactsJson = await contactsRes.json();
       setVisitors(visitorsJson.visitors || []);
       setEvents(eventsJson.events || []);
+      const nextContacts = contactsJson.contacts || [];
+      setContacts(nextContacts);
+      setSelectedContactId((current) => current || nextContacts[0]?.id || null);
       refreshTrackerState();
     } catch (error) {
       setApiError(error instanceof Error ? error.message : "Unable to load tracking data.");
+    }
+  };
+
+  const loadContactActivity = async (contactId: string | null) => {
+    if (!contactId) {
+      setContactActivity(null);
+      return;
+    }
+    try {
+      const response = await fetch(`${API_ORIGIN}/contacts/${contactId}/activity`);
+      if (!response.ok) throw new Error("Unable to load contact activity.");
+      const json = await response.json();
+      setContactActivity({
+        summary: json.summary,
+        timeline: json.timeline || []
+      });
+    } catch {
+      setContactActivity(null);
     }
   };
 
@@ -86,6 +140,10 @@ function App() {
     const timer = window.setInterval(refreshTrackerState, 1500);
     return () => window.clearInterval(timer);
   }, []);
+
+  useEffect(() => {
+    void loadContactActivity(selectedContactId);
+  }, [selectedContactId]);
 
   const trackDemoEvent = (eventType: string, metadata: Record<string, unknown>) => {
     window.CRM247?.track(eventType, metadata);
@@ -241,6 +299,83 @@ function App() {
               ))
             )}
           </div>
+        </article>
+
+        <article className="panel table-panel">
+          <h2>Identified Contacts</h2>
+          <div className="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Email</th>
+                  <th>Views</th>
+                  <th>Sessions</th>
+                  <th>Action</th>
+                </tr>
+              </thead>
+              <tbody>
+                {contacts.length === 0 ? (
+                  <tr>
+                    <td colSpan={4}>No identified contacts yet.</td>
+                  </tr>
+                ) : (
+                  contacts.map((contact) => (
+                    <tr key={contact.id} className={selectedContactId === contact.id ? "selected-row" : ""}>
+                      <td>{contact.email}</td>
+                      <td>{contact.pageViewCount || 0}</td>
+                      <td>{contact.sessionCount || 0}</td>
+                      <td>
+                        <button
+                          type="button"
+                          className="small-button"
+                          onClick={() => setSelectedContactId(contact.id)}
+                        >
+                          Activity
+                        </button>
+                      </td>
+                    </tr>
+                  ))
+                )}
+              </tbody>
+            </table>
+          </div>
+        </article>
+
+        <article className="panel table-panel">
+          <h2>Contact Activity</h2>
+          {!selectedContactId ? (
+            <p>Select an identified contact to inspect the linked website timeline.</p>
+          ) : !contactActivity ? (
+            <p>No linked activity loaded yet.</p>
+          ) : (
+            <>
+              <div className="summary-strip">
+                <span>{contactActivity.summary.websiteEventCount} events</span>
+                <span>{contactActivity.summary.visitorCount} visitor ids</span>
+              </div>
+              <div className="top-pages">
+                {contactActivity.summary.topPages.length === 0 ? (
+                  <p>No page views linked to this contact.</p>
+                ) : (
+                  contactActivity.summary.topPages.map((page) => (
+                    <div key={page.pageUrl}>
+                      <strong>{page.pageTitle || page.pageUrl}</strong>
+                      <span>{page.count} views</span>
+                    </div>
+                  ))
+                )}
+              </div>
+              <div className="event-list compact-list">
+                {contactActivity.timeline.slice(0, 10).map((event) => (
+                  <div className="event-row" key={event.id}>
+                    <strong>{event.type}</strong>
+                    <span>{new Date(event.timestamp).toLocaleTimeString()}</span>
+                    <small>{event.pageTitle || event.pageUrl}</small>
+                  </div>
+                ))}
+              </div>
+            </>
+          )}
         </article>
       </section>
     </main>

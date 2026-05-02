@@ -204,6 +204,16 @@ th {
   text-transform: uppercase;
 }
 
+.selected-row {
+  background: #fff1f2;
+}
+
+.small-button {
+  border-radius: 6px;
+  font-size: 12px;
+  padding: 6px 9px;
+}
+
 .event-list {
   display: grid;
   gap: 8px;
@@ -229,6 +239,56 @@ th {
 .event-row small {
   color: #64748b;
   font-size: 12px;
+}
+
+.summary-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.summary-strip span {
+  border-radius: 999px;
+  background: #fff1f2;
+  color: #be123c;
+  font-size: 12px;
+  font-weight: 700;
+  padding: 6px 10px;
+}
+
+.top-pages {
+  display: grid;
+  gap: 8px;
+}
+
+.top-pages div {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  border: 1px solid #e2e8f0;
+  border-radius: 7px;
+  padding: 9px 10px;
+}
+
+.top-pages strong,
+.top-pages span {
+  font-size: 12px;
+}
+
+.top-pages strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.top-pages span {
+  flex: 0 0 auto;
+  color: #64748b;
+}
+
+.compact-list {
+  margin-top: 14px;
 }
 
 @media (max-width: 900px) {

@@ -46,7 +46,9 @@ Implemented:
 - visitor registration endpoint
 - batched website event ingestion
 - visitor identify endpoint
+- contacts API and contact activity timeline
 - demo UI that loads and exercises the tracker
+- demo UI for identified contacts and linked website activity
 
 ## Local Setup
 
@@ -80,9 +82,10 @@ npm run dev:web
 2. Tracker creates `eg_visitor_id`.
 3. Events are batched into MongoDB Atlas through `/track/events/batch`.
 4. Visitor is identified when email is captured through `/track/identify`.
-5. Email open/click events are recorded in a later phase.
-6. LangGraph agents analyze signals and create engagement queue items in a later phase.
-7. Dashboard shows queue, message draft, policy decision, and agent trace in a later phase.
+5. Contacts can be listed and inspected through `/contacts`.
+6. Email open/click events are recorded in a later phase.
+7. LangGraph agents analyze signals and create engagement queue items in a later phase.
+8. Dashboard shows queue, message draft, policy decision, and agent trace in a later phase.
 
 ## Phase 2 Endpoints
 
@@ -93,4 +96,8 @@ POST /track/events/batch
 POST /track/identify
 GET  /track/visitors
 GET  /track/events
+GET  /contacts
+GET  /contacts/:contactId
+PATCH /contacts/:contactId
+GET  /contacts/:contactId/activity
 ```

@@ -16,6 +16,8 @@ rootRouter.get("/", (_req, res) => {
         "POST /track/identify",
         "GET /track/visitors",
         "GET /track/events",
+        "GET /contacts",
+        "GET /contacts/:contactId/activity",
         "/email/open/:trackingId",
         "/email/click/:trackingId",
         "/engagement/runs"

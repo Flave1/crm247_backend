@@ -41,12 +41,17 @@ MongoDB collections:
 
 Goal: link anonymous visitors to contacts.
 
-Build:
+Status: **implemented**
+
+Built:
 
 - email normalization
 - contact upsert
 - visitor-to-contact linking
 - contact activity timeline
+- contact list endpoint
+- contact update endpoint
+- dashboard contact activity panel
 
 MongoDB collections:
 
