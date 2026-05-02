@@ -17,15 +17,20 @@ Deliverables:
 
 Goal: capture anonymous visitor activity.
 
-Build:
+Status: **implemented**
+
+Built:
 
 - `GET /tracker/:domainId.js`
 - `POST /track/visitor`
 - `POST /track/events/batch`
 - `POST /track/identify`
+- `GET /track/visitors`
+- `GET /track/events`
 - first-party cookie `eg_visitor_id`
 - session ID in localStorage
 - page view, click, form submit, time on page, exit intent
+- demo UI that loads the tracker and fires events
 
 MongoDB collections:
 
@@ -135,4 +140,3 @@ Build:
 - optional vector index
 - Retrieval Agent reads similar journeys and successful messages
 - Learning Agent writes outcomes after opens/clicks
-

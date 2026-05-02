@@ -1,8 +1,109 @@
-import React from "react";
+import React, { FormEvent, useEffect, useState } from "react";
 import { createRoot } from "react-dom/client";
 import "./styles.css";
 
+declare global {
+  interface Window {
+    CRM247?: {
+      track: (eventType: string, metadata?: Record<string, unknown>) => void;
+      identify: (email: string, properties?: Record<string, unknown>) => Promise<unknown>;
+      flush: () => void;
+      getState: () => Record<string, unknown>;
+    };
+  }
+}
+
+const API_ORIGIN = import.meta.env.VITE_API_ORIGIN || "http://localhost:8080";
+const DEMO_DOMAIN_ID = "demo-store";
+
+interface VisitorRow {
+  visitorId: string;
+  email?: string;
+  isIdentified?: boolean;
+  pageViewCount?: number;
+  sessionCount?: number;
+  totalActiveMs?: number;
+  lastSeenAt?: string;
+}
+
+interface EventRow {
+  _id?: string;
+  visitorId: string;
+  eventType: string;
+  pageUrl: string;
+  pageTitle?: string;
+  timestamp: string;
+  metadata?: Record<string, unknown>;
+}
+
 function App() {
+  const [trackerState, setTrackerState] = useState<Record<string, unknown> | null>(null);
+  const [email, setEmail] = useState("demo@crm247.local");
+  const [visitors, setVisitors] = useState<VisitorRow[]>([]);
+  const [events, setEvents] = useState<EventRow[]>([]);
+  const [apiError, setApiError] = useState<string | null>(null);
+
+  const refreshTrackerState = () => {
+    setTrackerState(window.CRM247?.getState() || null);
+  };
+
+  const refreshData = async () => {
+    try {
+      setApiError(null);
+      const [visitorsRes, eventsRes] = await Promise.all([
+        fetch(`${API_ORIGIN}/track/visitors?domainId=${encodeURIComponent(DEMO_DOMAIN_ID)}`),
+        fetch(`${API_ORIGIN}/track/events?domainId=${encodeURIComponent(DEMO_DOMAIN_ID)}`)
+      ]);
+      if (!visitorsRes.ok || !eventsRes.ok) {
+        throw new Error("Tracking API is not ready yet.");
+      }
+      const visitorsJson = await visitorsRes.json();
+      const eventsJson = await eventsRes.json();
+      setVisitors(visitorsJson.visitors || []);
+      setEvents(eventsJson.events || []);
+      refreshTrackerState();
+    } catch (error) {
+      setApiError(error instanceof Error ? error.message : "Unable to load tracking data.");
+    }
+  };
+
+  useEffect(() => {
+    const existing = document.querySelector(`script[data-crm247-id="${DEMO_DOMAIN_ID}"]`);
+    if (existing) return;
+
+    const script = document.createElement("script");
+    script.src = `${API_ORIGIN}/tracker/${DEMO_DOMAIN_ID}.js`;
+    script.defer = true;
+    script.dataset.crm247Id = DEMO_DOMAIN_ID;
+    script.onload = () => {
+      window.setTimeout(() => {
+        refreshTrackerState();
+        void refreshData();
+      }, 600);
+    };
+    document.head.appendChild(script);
+
+    const timer = window.setInterval(refreshTrackerState, 1500);
+    return () => window.clearInterval(timer);
+  }, []);
+
+  const trackDemoEvent = (eventType: string, metadata: Record<string, unknown>) => {
+    window.CRM247?.track(eventType, metadata);
+    window.CRM247?.flush();
+    window.setTimeout(() => void refreshData(), 600);
+  };
+
+  const handleIdentify = async (event: FormEvent) => {
+    event.preventDefault();
+    if (!email.trim()) return;
+    await window.CRM247?.identify(email.trim(), {
+      source: "demo_form",
+      plan: "hackathon"
+    });
+    window.CRM247?.flush();
+    window.setTimeout(() => void refreshData(), 800);
+  };
+
   return (
     <main className="shell">
       <section className="hero">
@@ -15,27 +116,131 @@ function App() {
           </p>
         </div>
         <div className="status">
-          <span>Phase 1</span>
-          <strong>Foundation ready</strong>
+          <span>Phase 2</span>
+          <strong>Cookie tracking</strong>
+          <small>{trackerState ? "Tracker loaded" : "Waiting for tracker"}</small>
         </div>
       </section>
 
-      <section className="grid">
-        <article>
-          <h2>Cookie Tracking</h2>
-          <p>Next phase: first-party visitor ID, sessions, and batched website events.</p>
+      <section className="demo-grid">
+        <article className="panel primary-panel">
+          <h2>Demo Product Page</h2>
+          <p>
+            This page loads the generated tracker from the API. Use these actions
+            to create page, click, form, and custom engagement events.
+          </p>
+          <div className="actions">
+            <button
+              type="button"
+              data-track-id="view-product"
+              onClick={() =>
+                trackDemoEvent("custom", {
+                  name: "product_interest",
+                  product: "Atlas Agent Console",
+                  value: 149
+                })
+              }
+            >
+              View product
+            </button>
+            <button
+              type="button"
+              data-track-id="start-checkout"
+              onClick={() =>
+                trackDemoEvent("custom", {
+                  name: "checkout_started",
+                  product: "Atlas Agent Console"
+                })
+              }
+            >
+              Start checkout
+            </button>
+            <button
+              type="button"
+              data-track-id="pricing-click"
+              onClick={() =>
+                trackDemoEvent("click", {
+                  cta: "pricing",
+                  intent: "high"
+                })
+              }
+            >
+              Pricing CTA
+            </button>
+          </div>
+
+          <form className="identify-form" onSubmit={handleIdentify}>
+            <label htmlFor="email">Identify visitor</label>
+            <div>
+              <input
+                id="email"
+                name="email"
+                type="email"
+                value={email}
+                onChange={(event) => setEmail(event.target.value)}
+                placeholder="customer@example.com"
+              />
+              <button type="submit">Identify</button>
+            </div>
+          </form>
         </article>
-        <article>
-          <h2>Email Tracking</h2>
-          <p>Open pixels, click redirects, outbound message records, and contact timelines.</p>
+
+        <article className="panel">
+          <h2>Tracker State</h2>
+          <pre>{JSON.stringify(trackerState || { status: "not_loaded" }, null, 2)}</pre>
+          <button type="button" className="secondary" onClick={() => void refreshData()}>
+            Refresh Mongo data
+          </button>
+          {apiError && <p className="error">{apiError}</p>}
         </article>
-        <article>
-          <h2>LangGraph Agents</h2>
-          <p>Supervisor, signal, intent, retrieval, strategy, message, policy, delivery, and learning agents.</p>
+
+        <article className="panel table-panel">
+          <h2>Recent Visitors</h2>
+          <div className="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Visitor</th>
+                  <th>Email</th>
+                  <th>Views</th>
+                  <th>Sessions</th>
+                </tr>
+              </thead>
+              <tbody>
+                {visitors.length === 0 ? (
+                  <tr>
+                    <td colSpan={4}>No visitors yet.</td>
+                  </tr>
+                ) : (
+                  visitors.map((visitor) => (
+                    <tr key={visitor.visitorId}>
+                      <td>{visitor.visitorId.slice(0, 18)}...</td>
+                      <td>{visitor.email || (visitor.isIdentified ? "identified" : "anonymous")}</td>
+                      <td>{visitor.pageViewCount || 0}</td>
+                      <td>{visitor.sessionCount || 0}</td>
+                    </tr>
+                  ))
+                )}
+              </tbody>
+            </table>
+          </div>
         </article>
-        <article>
-          <h2>MongoDB Atlas</h2>
-          <p>Shared context, checkpoints, decision traces, queue state, and adaptive memory.</p>
+
+        <article className="panel table-panel">
+          <h2>Recent Events</h2>
+          <div className="event-list">
+            {events.length === 0 ? (
+              <p>No events yet.</p>
+            ) : (
+              events.slice(0, 12).map((event) => (
+                <div className="event-row" key={event._id || `${event.visitorId}-${event.timestamp}`}>
+                  <strong>{event.eventType}</strong>
+                  <span>{new Date(event.timestamp).toLocaleTimeString()}</span>
+                  <small>{event.pageTitle || event.pageUrl}</small>
+                </div>
+              ))
+            )}
+          </div>
         </article>
       </section>
     </main>
@@ -43,4 +248,3 @@ function App() {
 }
 
 createRoot(document.getElementById("root") as HTMLElement).render(<App />);
-
