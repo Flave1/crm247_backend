@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import unquote
@@ -76,12 +76,15 @@ EngagementRunStatus = Literal["draft", "running", "paused", "completed", "failed
 EngagementQueueStatus = Literal[
     "pending_approval",
     "queued",
+    "processing",
     "sent",
     "paused",
     "skipped",
     "failed",
     "blocked",
+    "dead_lettered",
 ]
+RunContactStatus = Literal["pending", "processing", "completed", "failed"]
 EngagementIntentLevel = Literal["Cold", "Warm", "Hot", "Ready to Buy"]
 EngagementRiskLevel = Literal["low", "medium", "high"]
 EngagementEscalationMedium = Literal["in_app", "slack", "teams", "sms"]
@@ -89,6 +92,11 @@ EngagementEscalationMedium = Literal["in_app", "slack", "teams", "sms"]
 DEFAULT_GOAL = "checkout_recovery"
 DEFAULT_CONFIDENCE_THRESHOLD = 72
 DEFAULT_ESCALATION_MEDIA: list[EngagementEscalationMedium] = ["in_app"]
+DEFAULT_RUN_BATCH_SIZE = 25
+DEFAULT_RUN_CONTACT_MAX_ATTEMPTS = 3
+DEFAULT_QUEUE_MAX_RETRIES = 3
+DEFAULT_QUEUE_WORKER_LIMIT = 50
+DEFAULT_PROCESSING_LEASE_SECONDS = 120
 TRANSPARENT_GIF = (
     b"GIF89a\x01\x00\x01\x00\xf0\x00\x00\xff\xff\xff\x00\x00\x00!"
     b"\xf9\x04\x00\x00\x00\x00\x00,\x00\x00\x00\x00\x01\x00\x01\x00"
@@ -153,11 +161,13 @@ class SendEmailRequest(BaseModel):
 
 class CreateEngagementRunRequest(BaseModel):
     domainId: str = Field(min_length=1, max_length=120)
-    contactId: str = Field(min_length=1, max_length=120)
+    contactId: str | None = Field(default=None, min_length=1, max_length=120)
+    contactIds: list[str] | None = Field(default=None, max_length=500)
     name: str | None = Field(default=None, max_length=200)
     goal: str | None = Field(default=None, max_length=120)
     autonomyMode: AutonomyMode | None = None
     confidenceThreshold: int | None = Field(default=None, ge=0, le=100)
+    analysisBatchSize: int | None = Field(default=None, ge=1, le=200)
     contextDomain: str | None = Field(default=None, max_length=255)
     businessDescription: str | None = Field(default=None, max_length=4000)
     escalationMedia: list[EngagementEscalationMedium] | None = Field(default=None, max_length=4)
@@ -191,6 +201,18 @@ class SaveMessageRequest(BaseModel):
     subject: str | None = Field(default=None, max_length=240)
     body: str = Field(min_length=1, max_length=20000)
     edited: bool = True
+
+
+class ProcessRunRequest(BaseModel):
+    batchSize: int | None = Field(default=None, ge=1, le=200)
+    drain: bool = True
+    autoExecuteQueue: bool = True
+
+
+class ProcessQueueRequest(BaseModel):
+    runId: str | None = Field(default=None, max_length=120)
+    queueItemId: str | None = Field(default=None, max_length=120)
+    limit: int = Field(default=DEFAULT_QUEUE_WORKER_LIMIT, ge=1, le=500)
 
 
 def get_db() -> Database:
@@ -228,6 +250,26 @@ def safe_timestamp(value: str | None) -> str:
 
 def clamp(value: int | float, minimum: int, maximum: int) -> int:
     return max(minimum, min(int(value), maximum))
+
+
+def parse_iso(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(timezone.utc)
+    except ValueError:
+        return None
+
+
+def due_at(value: str | None, *, default_due: bool = True) -> bool:
+    parsed = parse_iso(value)
+    if parsed is None:
+        return default_due
+    return parsed <= datetime.now(timezone.utc)
+
+
+def plus_seconds_iso(seconds: int) -> str:
+    return (datetime.now(timezone.utc) + timedelta(seconds=seconds)).isoformat().replace("+00:00", "Z")
 
 
 def active_ms_delta(metadata: dict[str, Any]) -> int:
@@ -284,8 +326,12 @@ def ensure_indexes() -> None:
     db["engagement_runs"].create_index([("id", 1)], unique=True)
     db["engagement_runs"].create_index([("status", 1), ("createdAt", -1)])
     db["engagement_runs"].create_index([("domainId", 1), ("createdAt", -1)])
+    db["engagement_run_contacts"].create_index([("id", 1)], unique=True)
+    db["engagement_run_contacts"].create_index([("runId", 1), ("status", 1), ("nextAttemptAt", 1)])
+    db["engagement_run_contacts"].create_index([("runId", 1), ("contactId", 1)], unique=True)
     db["engagement_queue"].create_index([("id", 1)], unique=True)
     db["engagement_queue"].create_index([("runId", 1), ("createdAt", -1)])
+    db["engagement_queue"].create_index([("status", 1), ("nextAttemptAt", 1)])
     db["agent_decision_traces"].create_index([("id", 1)], unique=True)
     db["agent_decision_traces"].create_index([("runId", 1), ("contactId", 1), ("createdAt", -1)])
     db["agent_tasks"].create_index([("runId", 1), ("createdAt", -1)])
@@ -329,9 +375,13 @@ def public_run(run: dict[str, Any] | None) -> dict[str, Any] | None:
         "goal": run.get("goal"),
         "domainId": run.get("domainId"),
         "contactId": run.get("contactId"),
+        "contactIds": run.get("contactIds") or ([run.get("contactId")] if run.get("contactId") else []),
         "autonomyMode": run.get("autonomyMode"),
         "status": run.get("status"),
         "enrolledCount": int(run.get("enrolledCount") or 0),
+        "pendingContactCount": int(run.get("pendingContactCount") or 0),
+        "completedContactCount": int(run.get("completedContactCount") or 0),
+        "failedContactCount": int(run.get("failedContactCount") or 0),
         "confidenceThreshold": int(run.get("confidenceThreshold") or 0),
         "contextDomain": run.get("contextDomain"),
         "businessDescription": run.get("businessDescription"),
@@ -354,8 +404,32 @@ def public_run(run: dict[str, Any] | None) -> dict[str, Any] | None:
         "latestIntentScore": run.get("latestIntentScore"),
         "latestIntentLevel": run.get("latestIntentLevel"),
         "latestRecommendedAction": run.get("latestRecommendedAction"),
+        "lastQueueProcessedAt": run.get("lastQueueProcessedAt"),
         "createdAt": run.get("createdAt"),
         "updatedAt": run.get("updatedAt"),
+    }
+
+
+def public_run_contact(item: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": item.get("id"),
+        "runId": item.get("runId"),
+        "contactId": item.get("contactId"),
+        "domainId": item.get("domainId"),
+        "status": item.get("status"),
+        "attemptCount": int(item.get("attemptCount") or 0),
+        "maxAttempts": int(item.get("maxAttempts") or 0),
+        "lastError": item.get("lastError"),
+        "nextAttemptAt": item.get("nextAttemptAt"),
+        "processingStartedAt": item.get("processingStartedAt"),
+        "leaseExpiresAt": item.get("leaseExpiresAt"),
+        "lastIntentScore": item.get("lastIntentScore"),
+        "lastIntentLevel": item.get("lastIntentLevel"),
+        "lastRecommendedAction": item.get("lastRecommendedAction"),
+        "lastQueueItemId": item.get("lastQueueItemId"),
+        "processedAt": item.get("processedAt"),
+        "createdAt": item.get("createdAt"),
+        "updatedAt": item.get("updatedAt"),
     }
 
 
@@ -387,6 +461,7 @@ def public_queue_item(item: dict[str, Any]) -> dict[str, Any]:
         "scheduledSendAt": item.get("scheduledSendAt"),
         "nextAttemptAt": item.get("nextAttemptAt"),
         "processingStartedAt": item.get("processingStartedAt"),
+        "leaseExpiresAt": item.get("leaseExpiresAt"),
         "lastErrorAt": item.get("lastErrorAt"),
         "deadLetteredAt": item.get("deadLetteredAt"),
         "escalationReason": item.get("escalationReason"),
@@ -720,6 +795,214 @@ def update_run(db: Database, run_id: str, update: dict[str, Any]) -> None:
     )
 
 
+def dedupe_contact_ids(contact_ids: list[str]) -> list[str]:
+    unique: list[str] = []
+    seen: set[str] = set()
+    for contact_id in contact_ids:
+        normalized = contact_id.strip()
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        unique.append(normalized)
+    return unique
+
+
+def load_run_contacts_for_payload(db: Database, payload: CreateEngagementRunRequest) -> list[dict[str, Any]]:
+    requested_ids: list[str] = []
+    if payload.contactId:
+        requested_ids.append(payload.contactId)
+    requested_ids.extend(payload.contactIds or [])
+    contact_ids = dedupe_contact_ids(requested_ids)
+    if not contact_ids:
+        raise HTTPException(status_code=400, detail="At least one contactId is required")
+    contacts: list[dict[str, Any]] = []
+    missing_ids: list[str] = []
+    for contact_id in contact_ids:
+        contact_object_id = object_id_from(contact_id)
+        if not contact_object_id:
+            raise HTTPException(status_code=400, detail=f"Invalid contact id: {contact_id}")
+        contact = db["contacts"].find_one({"_id": contact_object_id, "domainId": payload.domainId})
+        if not contact:
+            missing_ids.append(contact_id)
+            continue
+        contacts.append(contact)
+    if missing_ids:
+        raise HTTPException(status_code=404, detail=f"Contacts not found: {', '.join(missing_ids)}")
+    return contacts
+
+
+def seed_run_contacts(db: Database, run: dict[str, Any], contact_ids: list[str]) -> None:
+    timestamp = now_iso()
+    for contact_id in contact_ids:
+        db["engagement_run_contacts"].update_one(
+            {"runId": run["id"], "contactId": contact_id},
+            {
+                "$setOnInsert": {
+                    "id": os.urandom(8).hex(),
+                    "runId": run["id"],
+                    "contactId": contact_id,
+                    "domainId": run["domainId"],
+                    "status": "pending",
+                    "attemptCount": 0,
+                    "maxAttempts": DEFAULT_RUN_CONTACT_MAX_ATTEMPTS,
+                    "lastError": None,
+                    "nextAttemptAt": timestamp,
+                    "processingStartedAt": None,
+                    "leaseExpiresAt": None,
+                    "lastIntentScore": None,
+                    "lastIntentLevel": None,
+                    "lastRecommendedAction": None,
+                    "lastQueueItemId": None,
+                    "processedAt": None,
+                    "createdAt": timestamp,
+                    "updatedAt": timestamp,
+                }
+            },
+            upsert=True,
+        )
+
+
+def refresh_run_metrics(db: Database, run_id: str) -> dict[str, Any]:
+    run = db["engagement_runs"].find_one({"id": run_id})
+    if not run:
+        raise HTTPException(status_code=404, detail="Run not found")
+    total = db["engagement_run_contacts"].count_documents({"runId": run_id})
+    pending = db["engagement_run_contacts"].count_documents({"runId": run_id, "status": "pending"})
+    processing = db["engagement_run_contacts"].count_documents({"runId": run_id, "status": "processing"})
+    completed = db["engagement_run_contacts"].count_documents({"runId": run_id, "status": "completed"})
+    failed = db["engagement_run_contacts"].count_documents({"runId": run_id, "status": "failed"})
+    queue_count = db["engagement_queue"].count_documents({"runId": run_id})
+    latest_queue_item = db["engagement_queue"].find_one({"runId": run_id}, sort=[("createdAt", -1)])
+    latest_completed = db["engagement_run_contacts"].find_one(
+        {"runId": run_id, "status": "completed"},
+        sort=[("processedAt", -1), ("updatedAt", -1)],
+    )
+    status: EngagementRunStatus = "running"
+    analysis_status = "running"
+    analysis_completed_at: str | None = None
+    analysis_error = run.get("analysisError")
+    if run.get("status") == "paused":
+        status = "paused"
+        analysis_status = "paused"
+    elif pending == 0 and processing == 0:
+        analysis_completed_at = now_iso()
+        if completed > 0:
+            status = "completed"
+            analysis_status = "completed"
+            analysis_error = None
+        else:
+            status = "failed"
+            analysis_status = "failed"
+            if not analysis_error:
+                analysis_error = "No contacts were processed successfully"
+    update_run(
+        db,
+        run_id,
+        {
+            "status": status,
+            "analysisStatus": analysis_status,
+            "analysisTotalContacts": total,
+            "analysisProcessedContacts": completed + failed,
+            "analysisCompletedAt": analysis_completed_at,
+            "analysisError": analysis_error,
+            "queueItemCount": queue_count,
+            "pendingContactCount": pending + processing,
+            "completedContactCount": completed,
+            "failedContactCount": failed,
+            "latestQueueItemId": latest_queue_item.get("id") if latest_queue_item else run.get("latestQueueItemId"),
+            "latestIntentScore": latest_completed.get("lastIntentScore") if latest_completed else run.get("latestIntentScore"),
+            "latestIntentLevel": latest_completed.get("lastIntentLevel") if latest_completed else run.get("latestIntentLevel"),
+            "latestRecommendedAction": latest_completed.get("lastRecommendedAction") if latest_completed else run.get("latestRecommendedAction"),
+        },
+    )
+    refreshed = db["engagement_runs"].find_one({"id": run_id})
+    assert refreshed is not None
+    return refreshed
+
+
+def claim_run_contact(db: Database, run_id: str) -> dict[str, Any] | None:
+    now = now_iso()
+    lease_expires_at = plus_seconds_iso(DEFAULT_PROCESSING_LEASE_SECONDS)
+    return db["engagement_run_contacts"].find_one_and_update(
+        {
+            "runId": run_id,
+            "status": "pending",
+            "$and": [
+                {"$or": [{"nextAttemptAt": None}, {"nextAttemptAt": {"$lte": now}}]},
+                {"$or": [{"leaseExpiresAt": None}, {"leaseExpiresAt": {"$lte": now}}]},
+            ],
+        },
+        {
+            "$set": {
+                "status": "processing",
+                "processingStartedAt": now,
+                "leaseExpiresAt": lease_expires_at,
+                "updatedAt": now,
+            }
+        },
+        sort=[("nextAttemptAt", 1), ("createdAt", 1)],
+        return_document=ReturnDocument.AFTER,
+    )
+
+
+def next_retry_timestamp(retry_count: int) -> str:
+    backoff_seconds = min(300, 30 * max(1, retry_count))
+    return plus_seconds_iso(backoff_seconds)
+
+
+def complete_run_contact(
+    db: Database,
+    item: dict[str, Any],
+    *,
+    queue_item_id: str,
+    intent_score: int,
+    intent_level: EngagementIntentLevel,
+    recommended_action: str,
+) -> None:
+    timestamp = now_iso()
+    db["engagement_run_contacts"].update_one(
+        {"id": item["id"]},
+        {
+            "$set": {
+                "status": "completed",
+                "attemptCount": int(item.get("attemptCount") or 0) + 1,
+                "lastError": None,
+                "nextAttemptAt": None,
+                "processingStartedAt": None,
+                "leaseExpiresAt": None,
+                "lastIntentScore": intent_score,
+                "lastIntentLevel": intent_level,
+                "lastRecommendedAction": recommended_action,
+                "lastQueueItemId": queue_item_id,
+                "processedAt": timestamp,
+                "updatedAt": timestamp,
+            }
+        },
+    )
+
+
+def fail_run_contact(db: Database, item: dict[str, Any], error: Exception) -> None:
+    attempt_count = int(item.get("attemptCount") or 0) + 1
+    timestamp = now_iso()
+    max_attempts = int(item.get("maxAttempts") or DEFAULT_RUN_CONTACT_MAX_ATTEMPTS)
+    status: RunContactStatus = "pending" if attempt_count < max_attempts else "failed"
+    db["engagement_run_contacts"].update_one(
+        {"id": item["id"]},
+        {
+            "$set": {
+                "status": status,
+                "attemptCount": attempt_count,
+                "lastError": str(error),
+                "nextAttemptAt": next_retry_timestamp(attempt_count) if status == "pending" else None,
+                "processingStartedAt": None,
+                "leaseExpiresAt": None,
+                "processedAt": timestamp if status == "failed" else None,
+                "updatedAt": timestamp,
+            }
+        },
+    )
+
+
 def load_run_context(db: Database, run_id: str, contact_id: str, domain_id: str) -> dict[str, Any]:
     contact_object_id = object_id_from(contact_id)
     if not contact_object_id:
@@ -801,17 +1084,13 @@ def create_escalation_notifications(
     db["engagement_notifications"].insert_many(notifications)
 
 
-def run_engagement_flow(db: Database, run_id: str) -> dict[str, Any]:
-    run = db["engagement_runs"].find_one({"id": run_id})
-    if not run:
-        raise ValueError("Run not found")
-    contact_id = string_value(run.get("contactId"))
+def analyze_contact_for_run(db: Database, run: dict[str, Any], contact_id: str) -> dict[str, Any]:
+    run_id = string_value(run.get("id"))
     domain_id = string_value(run.get("domainId"))
     goal = string_value(run.get("goal"), DEFAULT_GOAL)
     autonomy_mode: AutonomyMode = run.get("autonomyMode") or "guardrailed"
     confidence_threshold = clamp(run.get("confidenceThreshold") or DEFAULT_CONFIDENCE_THRESHOLD, 0, 100)
     write_agent_task(db, run_id, contact_id, "Supervisor Agent", "started", "Starting engagement analysis")
-    update_run(db, run_id, {"status": "running", "analysisStatus": "running", "analysisStartedAt": now_iso()})
     try:
         context = load_run_context(db, run_id, contact_id, domain_id)
         retrieved_context = summarize_retrieved_context(
@@ -894,13 +1173,14 @@ def run_engagement_flow(db: Database, run_id: str) -> dict[str, Any]:
         )
         queue_item_id = os.urandom(8).hex()
         timestamp = now_iso()
+        queue_status = policy_decision["queueStatus"]
         queue_item = {
             "id": queue_item_id,
             "runId": run_id,
             "contactId": contact_id,
             "domainId": domain_id,
             "action": recommendation["action"],
-            "status": policy_decision["queueStatus"],
+            "status": queue_status,
             "confidence": confidence,
             "risk": policy_decision["risk"],
             "reason": recommendation["rationale"],
@@ -913,14 +1193,15 @@ def run_engagement_flow(db: Database, run_id: str) -> dict[str, Any]:
             "personalizedGeneratedAt": timestamp,
             "personalizedSavedAt": None,
             "personalizedEdited": False,
-            "deliveryStatus": "queued" if policy_decision["queueStatus"] == "queued" else None,
+            "deliveryStatus": "queued" if queue_status == "queued" else None,
             "deliveryMessageId": None,
             "deliveryError": None,
             "retryCount": 0,
-            "maxRetries": 3,
-            "scheduledSendAt": None,
-            "nextAttemptAt": None,
+            "maxRetries": DEFAULT_QUEUE_MAX_RETRIES,
+            "scheduledSendAt": timestamp if queue_status == "queued" else None,
+            "nextAttemptAt": timestamp if queue_status == "queued" else None,
             "processingStartedAt": None,
+            "leaseExpiresAt": None,
             "lastErrorAt": None,
             "deadLetteredAt": None,
             "escalationReason": None,
@@ -938,7 +1219,7 @@ def run_engagement_flow(db: Database, run_id: str) -> dict[str, Any]:
             "executedAt": None,
         }
         db["engagement_queue"].insert_one(queue_item)
-        if policy_decision["queueStatus"] in {"pending_approval", "blocked"}:
+        if queue_status in {"pending_approval", "blocked"}:
             create_escalation_notifications(
                 db,
                 run,
@@ -973,37 +1254,22 @@ def run_engagement_flow(db: Database, run_id: str) -> dict[str, Any]:
             contact_id,
             "Delivery Agent",
             "completed",
-            f"Created queue item with status {policy_decision['queueStatus']}",
+            f"Created queue item with status {queue_status}",
         )
         write_decision_trace(
             db,
             run_id,
             contact_id,
             "Delivery Agent",
-            {"recommendedAction": recommendation["action"], "queueStatus": policy_decision["queueStatus"]},
+            {"recommendedAction": recommendation["action"], "queueStatus": queue_status},
             {"step": "queue_action"},
             {
                 "queueItemId": queue_item_id,
-                "queueStatus": policy_decision["queueStatus"],
-                "deliveryStatus": "queued" if policy_decision["queueStatus"] == "queued" else None,
+                "queueStatus": queue_status,
+                "deliveryStatus": "queued" if queue_status == "queued" else None,
             },
             policy_decision,
             queue_item_id,
-        )
-        update_run(
-            db,
-            run_id,
-            {
-                "status": "completed",
-                "analysisStatus": "completed",
-                "analysisProcessedContacts": 1,
-                "analysisCompletedAt": timestamp,
-                "queueItemCount": 1,
-                "latestQueueItemId": queue_item_id,
-                "latestIntentScore": intent_score,
-                "latestIntentLevel": intent_level,
-                "latestRecommendedAction": recommendation["action"],
-            },
         )
         write_agent_task(db, run_id, contact_id, "Supervisor Agent", "completed", "Completed engagement analysis")
         write_decision_trace(
@@ -1018,7 +1284,7 @@ def run_engagement_flow(db: Database, run_id: str) -> dict[str, Any]:
                 "intentLevel": intent_level,
                 "recommendedAction": recommendation["action"],
                 "queueItemId": queue_item_id,
-                "queueStatus": policy_decision["queueStatus"],
+                "queueStatus": queue_status,
             },
             policy_decision,
             queue_item_id,
@@ -1028,23 +1294,346 @@ def run_engagement_flow(db: Database, run_id: str) -> dict[str, Any]:
             "intentLevel": intent_level,
             "recommendedAction": recommendation["action"],
             "queueItemId": queue_item_id,
-            "queueStatus": policy_decision["queueStatus"],
+            "queueStatus": queue_status,
             "policyDecision": policy_decision,
             "retrievedContext": retrieved_context,
         }
     except Exception as error:
-        update_run(
-            db,
-            run_id,
-            {
-                "status": "failed",
-                "analysisStatus": "failed",
-                "analysisError": str(error),
-                "analysisCompletedAt": now_iso(),
-            },
-        )
         write_agent_task(db, run_id, contact_id, "Supervisor Agent", "failed", str(error))
         raise
+
+
+def release_claimed_queue_item(db: Database, item_id: str) -> None:
+    db["engagement_queue"].update_one(
+        {"id": item_id},
+        {"$set": {"status": "queued", "processingStartedAt": None, "leaseExpiresAt": None, "updatedAt": now_iso()}},
+    )
+
+
+def claim_queue_item(
+    db: Database,
+    *,
+    run_id: str | None = None,
+    queue_item_id: str | None = None,
+) -> dict[str, Any] | None:
+    now = now_iso()
+    lease_expires_at = plus_seconds_iso(DEFAULT_PROCESSING_LEASE_SECONDS)
+    query: dict[str, Any] = {
+        "status": "queued",
+        "$and": [
+            {"$or": [{"nextAttemptAt": None}, {"nextAttemptAt": {"$lte": now}}]},
+            {"$or": [{"leaseExpiresAt": None}, {"leaseExpiresAt": {"$lte": now}}]},
+        ],
+    }
+    if run_id:
+        query["runId"] = run_id
+    if queue_item_id:
+        query["id"] = queue_item_id
+    return db["engagement_queue"].find_one_and_update(
+        query,
+        {
+            "$set": {
+                "status": "processing",
+                "processingStartedAt": now,
+                "leaseExpiresAt": lease_expires_at,
+                "updatedAt": now,
+            }
+        },
+        sort=[("nextAttemptAt", 1), ("createdAt", 1)],
+        return_document=ReturnDocument.AFTER,
+    )
+
+
+def finalize_queue_retry(
+    db: Database,
+    run: dict[str, Any],
+    item: dict[str, Any],
+    error: Exception,
+) -> dict[str, Any]:
+    timestamp = now_iso()
+    retry_count = int(item.get("retryCount") or 0) + 1
+    max_retries = int(item.get("maxRetries") or DEFAULT_QUEUE_MAX_RETRIES)
+    if retry_count >= max_retries:
+        db["engagement_queue"].update_one(
+            {"id": item["id"]},
+            {
+                "$set": {
+                    "status": "dead_lettered",
+                    "deliveryStatus": "failed",
+                    "deliveryError": str(error),
+                    "retryCount": retry_count,
+                    "nextAttemptAt": None,
+                    "processingStartedAt": None,
+                    "leaseExpiresAt": None,
+                    "lastErrorAt": timestamp,
+                    "deadLetteredAt": timestamp,
+                    "escalationReason": f"delivery_failed:{error}",
+                    "updatedAt": timestamp,
+                }
+            },
+        )
+        create_escalation_notifications(
+            db,
+            run,
+            string_value(item.get("id")),
+            string_value(item.get("contactId")),
+            string_value(item.get("action")),
+            f"Delivery failed permanently: {error}",
+            int(item.get("confidence") or 0),
+            "high",
+        )
+    else:
+        db["engagement_queue"].update_one(
+            {"id": item["id"]},
+            {
+                "$set": {
+                    "status": "queued",
+                    "deliveryStatus": "queued",
+                    "deliveryError": str(error),
+                    "retryCount": retry_count,
+                    "nextAttemptAt": next_retry_timestamp(retry_count),
+                    "processingStartedAt": None,
+                    "leaseExpiresAt": None,
+                    "lastErrorAt": timestamp,
+                    "updatedAt": timestamp,
+                }
+            },
+        )
+    updated = db["engagement_queue"].find_one({"id": item["id"]})
+    assert updated is not None
+    return updated
+
+
+def execute_claimed_queue_item(db: Database, run: dict[str, Any], item: dict[str, Any]) -> dict[str, Any]:
+    if run.get("status") == "paused":
+        release_claimed_queue_item(db, string_value(item.get("id")))
+        updated = db["engagement_queue"].find_one({"id": item["id"]})
+        assert updated is not None
+        return updated
+    timestamp = now_iso()
+    status = string_value(item.get("status"))
+    if not bool(item.get("shouldSendMessage")):
+        db["engagement_queue"].update_one(
+            {"id": item["id"]},
+            {
+                "$set": {
+                    "status": "skipped",
+                    "executedAt": timestamp,
+                    "updatedAt": timestamp,
+                    "deliveryStatus": None,
+                    "deliveryMessageId": None,
+                    "processingStartedAt": None,
+                    "leaseExpiresAt": None,
+                }
+            },
+        )
+        write_decision_trace(
+            db,
+            string_value(run.get("id")),
+            string_value(item.get("contactId")),
+            "Delivery Agent",
+            {"status": status, "shouldSendMessage": False},
+            {"step": "execute_queue_item", "mode": "skip_no_send"},
+            {"status": "skipped"},
+            queue_item_id=string_value(item.get("id")),
+        )
+        updated = db["engagement_queue"].find_one({"id": item["id"]})
+        assert updated is not None
+        return updated
+    try:
+        subject = string_value(item.get("personalizedSubject"))
+        body = string_value(item.get("personalizedBody"))
+        if not subject or not body:
+            generated = generate_queue_message_draft(db, run, item)
+            subject = generated["personalizedSubject"]
+            body = generated["personalizedBody"]
+            db["engagement_queue"].update_one(
+                {"id": item["id"]},
+                {
+                    "$set": {
+                        "personalizedChannel": "email",
+                        "personalizedSubject": subject,
+                        "personalizedBody": body,
+                        "personalizedGeneratedAt": timestamp,
+                        "updatedAt": timestamp,
+                    }
+                },
+            )
+        contact = db["contacts"].find_one(
+            {"_id": object_id_from(string_value(item.get("contactId"))), "domainId": string_value(run.get("domainId"))}
+        )
+        if not contact or not isinstance(contact.get("email"), str):
+            raise ValueError("Contact email is missing")
+        message = send_tracked_email(
+            db,
+            domain_id=string_value(run.get("domainId")),
+            contact_id=string_value(item.get("contactId")),
+            to=contact["email"],
+            subject=subject,
+            html=to_html_from_body(body),
+            text=body,
+            metadata={
+                "source": "engagement_queue_worker",
+                "runId": string_value(run.get("id")),
+                "queueItemId": string_value(item.get("id")),
+                "action": item.get("action"),
+            },
+            request_meta={"userAgent": "engagement-queue-worker", "ip": None},
+        )
+        db["engagement_queue"].update_one(
+            {"id": item["id"]},
+            {
+                "$set": {
+                    "status": "sent",
+                    "deliveryStatus": "sent",
+                    "deliveryMessageId": message["id"],
+                    "deliveryError": None,
+                    "executedAt": timestamp,
+                    "updatedAt": timestamp,
+                    "processingStartedAt": None,
+                    "leaseExpiresAt": None,
+                    "personalizedChannel": "email",
+                    "personalizedSubject": subject,
+                    "personalizedBody": body,
+                }
+            },
+        )
+        write_agent_task(
+            db,
+            string_value(run.get("id")),
+            string_value(item.get("contactId")),
+            "Delivery Agent",
+            "completed",
+            f"Sent queue item {item['id']}",
+        )
+        write_decision_trace(
+            db,
+            string_value(run.get("id")),
+            string_value(item.get("contactId")),
+            "Delivery Agent",
+            {"status": status, "action": item.get("action")},
+            {"step": "execute_queue_item", "mode": "send_tracked_email"},
+            {"deliveryMessageId": message["id"], "deliveryTrackingId": message["trackingId"], "status": "sent"},
+            queue_item_id=string_value(item.get("id")),
+        )
+        updated = db["engagement_queue"].find_one({"id": item["id"]})
+        assert updated is not None
+        return updated
+    except Exception as error:
+        write_agent_task(
+            db,
+            string_value(run.get("id")),
+            string_value(item.get("contactId")),
+            "Delivery Agent",
+            "failed",
+            str(error),
+        )
+        return finalize_queue_retry(db, run, item, error)
+
+
+def process_queue_worker(
+    db: Database,
+    *,
+    run_id: str | None = None,
+    queue_item_id: str | None = None,
+    limit: int = DEFAULT_QUEUE_WORKER_LIMIT,
+) -> dict[str, Any]:
+    processed_items: list[dict[str, Any]] = []
+    counts = {"sent": 0, "skipped": 0, "retried": 0, "deadLettered": 0}
+    while len(processed_items) < max(1, limit):
+        item = claim_queue_item(db, run_id=run_id, queue_item_id=queue_item_id)
+        if not item:
+            break
+        run = db["engagement_runs"].find_one({"id": item.get("runId")})
+        if not run:
+            finalize_queue_retry(db, {"id": item.get("runId")}, item, ValueError("Run not found"))
+            processed_items.append(db["engagement_queue"].find_one({"id": item["id"]}) or item)
+            if queue_item_id:
+                break
+            continue
+        updated = execute_claimed_queue_item(db, run, item)
+        processed_items.append(updated)
+        if updated.get("status") == "sent":
+            counts["sent"] += 1
+        elif updated.get("status") == "skipped":
+            counts["skipped"] += 1
+        elif updated.get("status") == "dead_lettered":
+            counts["deadLettered"] += 1
+        elif updated.get("status") == "queued":
+            counts["retried"] += 1
+        if queue_item_id:
+            break
+    if run_id and processed_items:
+        update_run(db, run_id, {"lastQueueProcessedAt": now_iso()})
+        refresh_run_metrics(db, run_id)
+    return {
+        "processedCount": len(processed_items),
+        "items": [public_queue_item(item) for item in processed_items],
+        **counts,
+    }
+
+
+def process_run_worker(
+    db: Database,
+    run_id: str,
+    *,
+    batch_size: int,
+    drain: bool,
+    auto_execute_queue: bool,
+) -> dict[str, Any]:
+    run = db["engagement_runs"].find_one({"id": run_id})
+    if not run:
+        raise HTTPException(status_code=404, detail="Run not found")
+    if run.get("status") == "paused":
+        return {"processedContacts": 0, "results": [], "queue": {"processedCount": 0, "items": []}, "run": public_run(run)}
+    update_run(db, run_id, {"status": "running", "analysisStatus": "running", "analysisStartedAt": run.get("analysisStartedAt") or now_iso()})
+    processed_contacts = 0
+    results: list[dict[str, Any]] = []
+    max_to_process = batch_size if not drain else 10_000
+    while processed_contacts < max_to_process:
+        item = claim_run_contact(db, run_id)
+        if not item:
+            break
+        run = db["engagement_runs"].find_one({"id": run_id})
+        if not run or run.get("status") == "paused":
+            db["engagement_run_contacts"].update_one(
+                {"id": item["id"]},
+                {"$set": {"status": "pending", "processingStartedAt": None, "leaseExpiresAt": None, "updatedAt": now_iso()}},
+            )
+            break
+        try:
+            result = analyze_contact_for_run(db, run, string_value(item.get("contactId")))
+            complete_run_contact(
+                db,
+                item,
+                queue_item_id=result["queueItemId"],
+                intent_score=result["intentScore"],
+                intent_level=result["intentLevel"],
+                recommended_action=result["recommendedAction"],
+            )
+            results.append(result)
+        except Exception as error:
+            fail_run_contact(db, item, error)
+        processed_contacts += 1
+    refreshed_run = refresh_run_metrics(db, run_id)
+    queue_result = {"processedCount": 0, "items": [], "sent": 0, "skipped": 0, "retried": 0, "deadLettered": 0}
+    if auto_execute_queue:
+        queue_result = process_queue_worker(db, run_id=run_id, limit=DEFAULT_QUEUE_WORKER_LIMIT if drain else batch_size)
+        refreshed_run = refresh_run_metrics(db, run_id)
+    return {
+        "processedContacts": processed_contacts,
+        "results": results,
+        "queue": queue_result,
+        "run": public_run(refreshed_run),
+    }
+
+
+def run_engagement_flow(db: Database, run_id: str) -> dict[str, Any]:
+    run = db["engagement_runs"].find_one({"id": run_id})
+    if not run:
+        raise ValueError("Run not found")
+    batch_size = clamp(run.get("analysisBatchSize") or DEFAULT_RUN_BATCH_SIZE, 1, 200)
+    return process_run_worker(db, run_id, batch_size=batch_size, drain=True, auto_execute_queue=True)
 
 
 def get_run_and_queue_item_or_404(db: Database, run_id: str, queue_item_id: str) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -1059,9 +1648,12 @@ def get_run_and_queue_item_or_404(db: Database, run_id: str, queue_item_id: str)
 
 def generate_queue_message_draft(db: Database, run: dict[str, Any], item: dict[str, Any]) -> dict[str, str]:
     context = load_run_context(db, string_value(run.get("id")), string_value(item.get("contactId")), string_value(run.get("domainId")))
+    run_contact = db["engagement_run_contacts"].find_one(
+        {"runId": string_value(run.get("id")), "contactId": string_value(item.get("contactId"))}
+    )
     recommendation = build_recommended_action(
         string_value(run.get("goal"), DEFAULT_GOAL),
-        run.get("latestIntentLevel") or "Cold",
+        (run_contact or {}).get("lastIntentLevel") or run.get("latestIntentLevel") or "Cold",
         context["contact"],
         context["websiteSignals"],
         context["emailSignals"],
@@ -1202,79 +1794,36 @@ def inject_tracking_pixel(html: str, tracking_id: str) -> str:
 def approve_queue_item(db: Database, run_id: str, queue_item_id: str) -> dict[str, Any]:
     run, item = get_run_and_queue_item_or_404(db, run_id, queue_item_id)
     status = string_value(item.get("status"))
-    timestamp = now_iso()
     if status == "blocked":
         raise HTTPException(status_code=400, detail="Queue item is blocked by policy")
-    if status in {"sent", "skipped"}:
+    if status in {"sent", "skipped", "dead_lettered"}:
         return item
-    if not bool(item.get("shouldSendMessage")):
-        db["engagement_queue"].update_one(
-            {"runId": run_id, "id": queue_item_id},
-            {"$set": {"status": "skipped", "executedAt": timestamp, "updatedAt": timestamp, "deliveryStatus": None, "deliveryMessageId": None}},
-        )
-        write_decision_trace(
-            db,
-            run_id,
-            string_value(item.get("contactId")),
-            "Delivery Agent",
-            {"status": status, "shouldSendMessage": False},
-            {"step": "approve_queue_item", "mode": "skip_no_send"},
-            {"status": "skipped"},
-            queue_item_id=queue_item_id,
-        )
-        updated = db["engagement_queue"].find_one({"runId": run_id, "id": queue_item_id})
-        assert updated is not None
-        return updated
-    subject = string_value(item.get("personalizedSubject"))
-    body = string_value(item.get("personalizedBody"))
-    if not subject or not body:
-        generated = generate_queue_message_draft(db, run, item)
-        subject = generated["personalizedSubject"]
-        body = generated["personalizedBody"]
-        db["engagement_queue"].update_one(
-            {"runId": run_id, "id": queue_item_id},
-            {"$set": {"personalizedChannel": "email", "personalizedSubject": subject, "personalizedBody": body, "personalizedGeneratedAt": timestamp, "updatedAt": timestamp}},
-        )
-    contact = db["contacts"].find_one({"_id": object_id_from(string_value(item.get("contactId"))), "domainId": string_value(run.get("domainId"))})
-    if not contact or not isinstance(contact.get("email"), str):
-        raise HTTPException(status_code=400, detail="Contact email is missing")
-    message = send_tracked_email(
-        db,
-        domain_id=string_value(run.get("domainId")),
-        contact_id=string_value(item.get("contactId")),
-        to=contact["email"],
-        subject=subject,
-        html=to_html_from_body(body),
-        text=body,
-        metadata={"source": "engagement_queue_approval", "runId": run_id, "queueItemId": queue_item_id, "action": item.get("action")},
-        request_meta={"userAgent": "engagement-queue-approve", "ip": None},
-    )
+    timestamp = now_iso()
     db["engagement_queue"].update_one(
         {"runId": run_id, "id": queue_item_id},
         {
             "$set": {
-                "status": "sent",
-                "deliveryStatus": "sent",
-                "deliveryMessageId": message["id"],
-                "executedAt": timestamp,
+                "status": "queued",
+                "deliveryStatus": "queued" if bool(item.get("shouldSendMessage")) else None,
+                "deliveryError": None,
+                "nextAttemptAt": timestamp,
+                "processingStartedAt": None,
+                "leaseExpiresAt": None,
                 "updatedAt": timestamp,
-                "personalizedChannel": "email",
-                "personalizedSubject": subject,
-                "personalizedBody": body,
             }
         },
     )
-    write_agent_task(db, run_id, string_value(item.get("contactId")), "Delivery Agent", "completed", f"Approved and sent queue item {queue_item_id}")
     write_decision_trace(
         db,
         run_id,
         string_value(item.get("contactId")),
         "Delivery Agent",
         {"status": status, "action": item.get("action")},
-        {"step": "approve_queue_item", "mode": "send_tracked_email"},
-        {"deliveryMessageId": message["id"], "deliveryTrackingId": message["trackingId"], "status": "sent"},
+        {"step": "approve_queue_item", "mode": "queue_for_execution"},
+        {"status": "queued"},
         queue_item_id=queue_item_id,
     )
+    process_queue_worker(db, run_id=run_id, queue_item_id=queue_item_id, limit=1)
     updated = db["engagement_queue"].find_one({"runId": run_id, "id": queue_item_id})
     assert updated is not None
     return updated
@@ -1681,7 +2230,7 @@ def root() -> dict[str, Any]:
     return {
         "name": "crm247",
         "description": "Multi-agent autonomous engagement platform",
-        "phase": "5-python-backend",
+        "phase": "backend-auto-engagement",
         "endpoints": {
             "health": "/health",
             "roadmap": [
@@ -1704,12 +2253,15 @@ def root() -> dict[str, Any]:
                 "GET /engagement/runs",
                 "GET /engagement/runs/:runId",
                 "PATCH /engagement/runs/:runId",
+                "GET /engagement/runs/:runId/contacts",
+                "POST /engagement/runs/:runId/process",
                 "GET /engagement/runs/:runId/queue",
                 "GET /engagement/runs/:runId/queue/:queueItemId",
                 "POST /engagement/runs/:runId/queue/:queueItemId/approve",
                 "POST /engagement/runs/:runId/queue/:queueItemId/pause",
                 "POST /engagement/runs/:runId/queue/:queueItemId/generate-message",
                 "PUT /engagement/runs/:runId/queue/:queueItemId/message",
+                "POST /engagement/queue/process",
                 "GET /engagement/runs/:runId/decision-traces",
                 "GET /engagement/runs/:runId/graph",
                 "GET /engagement/runs/:runId/notifications",
@@ -2196,24 +2748,23 @@ def list_email_events(domainId: str | None = Query(default=None), contactId: str
 @app.post("/engagement/runs")
 def create_engagement_run(payload: CreateEngagementRunRequest) -> dict[str, Any]:
     db = get_db()
-    contact_object_id = object_id_from(payload.contactId)
-    if not contact_object_id:
-        raise HTTPException(status_code=400, detail="Invalid contact id")
-    contact = db["contacts"].find_one({"_id": contact_object_id, "domainId": payload.domainId})
-    if not contact:
-        raise HTTPException(status_code=404, detail="Contact not found")
+    contacts = load_run_contacts_for_payload(db, payload)
+    contact_ids = [str(contact["_id"]) for contact in contacts]
+    primary_contact = contacts[0]
     run_id = os.urandom(8).hex()
     timestamp = now_iso()
     goal = payload.goal or DEFAULT_GOAL
+    analysis_batch_size = clamp(payload.analysisBatchSize or DEFAULT_RUN_BATCH_SIZE, 1, 200)
     run = {
         "id": run_id,
-        "name": payload.name or normalize_run_name(contact, goal),
+        "name": payload.name or normalize_run_name(primary_contact, goal),
         "goal": goal,
         "domainId": payload.domainId,
-        "contactId": payload.contactId,
+        "contactId": contact_ids[0],
+        "contactIds": contact_ids,
         "autonomyMode": payload.autonomyMode or "guardrailed",
         "status": "running",
-        "enrolledCount": 1,
+        "enrolledCount": len(contact_ids),
         "confidenceThreshold": clamp(payload.confidenceThreshold or DEFAULT_CONFIDENCE_THRESHOLD, 0, 100),
         "contextDomain": payload.contextDomain,
         "businessDescription": payload.businessDescription,
@@ -2230,21 +2781,26 @@ def create_engagement_run(payload: CreateEngagementRunRequest) -> dict[str, Any]
             "meetingIntelligence": False,
         },
         "analysisStatus": "running",
-        "analysisBatchSize": 1,
-        "analysisTotalContacts": 1,
+        "analysisBatchSize": analysis_batch_size,
+        "analysisTotalContacts": len(contact_ids),
         "analysisProcessedContacts": 0,
         "analysisStartedAt": timestamp,
         "analysisCompletedAt": None,
         "analysisError": None,
+        "pendingContactCount": len(contact_ids),
+        "completedContactCount": 0,
+        "failedContactCount": 0,
         "queueItemCount": 0,
         "latestQueueItemId": None,
         "latestIntentScore": None,
         "latestIntentLevel": None,
         "latestRecommendedAction": None,
+        "lastQueueProcessedAt": None,
         "createdAt": timestamp,
         "updatedAt": timestamp,
     }
     db["engagement_runs"].insert_one(run)
+    seed_run_contacts(db, run, contact_ids)
     run_engagement_flow(db, run_id)
     created = db["engagement_runs"].find_one({"id": run_id})
     return {"ok": True, "run": public_run(created)}
@@ -2279,6 +2835,23 @@ def get_engagement_run(run_id: str) -> dict[str, Any]:
     return {"ok": True, "run": public_run(run)}
 
 
+@app.get("/engagement/runs/{run_id}/contacts")
+def list_engagement_run_contacts(
+    run_id: str,
+    status: RunContactStatus | None = Query(default=None),
+    limit: int = Query(default=200, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+) -> dict[str, Any]:
+    db = get_db()
+    if not db["engagement_runs"].find_one({"id": run_id}):
+        raise HTTPException(status_code=404, detail="Run not found")
+    query: dict[str, Any] = {"runId": run_id}
+    if status:
+        query["status"] = status
+    items = list(db["engagement_run_contacts"].find(query).sort("createdAt", 1).skip(offset).limit(limit))
+    return {"ok": True, "items": [public_run_contact(item) for item in items], "limit": limit, "offset": offset}
+
+
 @app.patch("/engagement/runs/{run_id}")
 def patch_engagement_run(run_id: str, payload: UpdateEngagementRunRequest) -> dict[str, Any]:
     db = get_db()
@@ -2311,6 +2884,22 @@ def patch_engagement_run(run_id: str, payload: UpdateEngagementRunRequest) -> di
     if not run:
         raise HTTPException(status_code=404, detail="Run not found")
     return {"ok": True, "run": public_run(run)}
+
+
+@app.post("/engagement/runs/{run_id}/process")
+def process_engagement_run(run_id: str, payload: ProcessRunRequest) -> dict[str, Any]:
+    db = get_db()
+    if not db["engagement_runs"].find_one({"id": run_id}):
+        raise HTTPException(status_code=404, detail="Run not found")
+    batch_size = clamp(payload.batchSize or DEFAULT_RUN_BATCH_SIZE, 1, 200)
+    result = process_run_worker(
+        db,
+        run_id,
+        batch_size=batch_size,
+        drain=payload.drain,
+        auto_execute_queue=payload.autoExecuteQueue,
+    )
+    return {"ok": True, **result}
 
 
 @app.get("/engagement/runs/{run_id}/queue")
@@ -2362,6 +2951,17 @@ def save_engagement_message(run_id: str, queue_item_id: str, payload: SaveMessag
     return {"ok": True, "item": public_queue_item(item)}
 
 
+@app.post("/engagement/queue/process")
+def process_engagement_queue(payload: ProcessQueueRequest) -> dict[str, Any]:
+    result = process_queue_worker(
+        get_db(),
+        run_id=payload.runId,
+        queue_item_id=payload.queueItemId,
+        limit=payload.limit,
+    )
+    return {"ok": True, **result}
+
+
 @app.get("/engagement/runs/{run_id}/decision-traces")
 def list_engagement_decision_traces(
     run_id: str,
@@ -2401,4 +3001,3 @@ def get_engagement_notifications(
         raise HTTPException(status_code=404, detail="Run not found")
     items = list(db["engagement_notifications"].find({"runId": run_id}).sort("createdAt", -1).skip(offset).limit(limit))
     return {"ok": True, "items": [public_notification(item) for item in items], "limit": limit, "offset": offset}
-

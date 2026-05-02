@@ -1,0 +1,13 @@
+.git
+node_modules
+dist
+build
+.env
+.env.local
+.DS_Store
+coverage
+.turbo
+__pycache__
+*.pyc
+apps/web/node_modules
+packages/shared/node_modules

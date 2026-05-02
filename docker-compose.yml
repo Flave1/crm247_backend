@@ -1,0 +1,43 @@
+services:
+  mongo:
+    image: mongo:7
+    restart: unless-stopped
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      mongo:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    environment:
+      NODE_ENV: development
+      API_PORT: "8080"
+      API_ORIGIN: http://localhost:8080
+      WEB_ORIGIN: http://localhost:5173
+      MONGODB_URI: mongodb://mongo:27017/crm247?directConnection=true
+      MONGODB_DB: crm247
+      EMAIL_FROM: no-reply@crm247.local
+      EMAIL_PROVIDER: console
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      LANGGRAPH_CHECKPOINT_COLLECTION: ${LANGGRAPH_CHECKPOINT_COLLECTION:-langgraph_checkpoints}
+      LANGGRAPH_WRITES_COLLECTION: ${LANGGRAPH_WRITES_COLLECTION:-langgraph_checkpoint_writes}
+      AUTO_ENGAGEMENT_ESCALATION_SLACK_CHANNEL: ${AUTO_ENGAGEMENT_ESCALATION_SLACK_CHANNEL:-}
+      AUTO_ENGAGEMENT_ESCALATION_TEAMS_CHANNEL: ${AUTO_ENGAGEMENT_ESCALATION_TEAMS_CHANNEL:-}
+      AUTO_ENGAGEMENT_ESCALATION_SMS_NUMBER: ${AUTO_ENGAGEMENT_ESCALATION_SMS_NUMBER:-}
+
+volumes:
+  mongo_data:

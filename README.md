@@ -54,8 +54,10 @@ Implemented:
 - demo UI for identified contacts and linked website activity
 - demo UI for creating and inspecting tracked emails
 - phase 5 engagement runs with Aurray-shaped run, queue, and decision trace records
-- deterministic LangGraph-style orchestration for one contact per run
-- in-app escalation records for approval or policy-held queue items, with Slack/Teams/SMS placeholders reserved
+- deterministic LangGraph-style orchestration for multi-contact runs
+- per-contact run state, claim-based processing, and queue execution workers
+- retry and dead-letter handling for delivery failures
+- in-app escalation records for approval, policy-held queue items, and permanent delivery failures, with Slack/Teams/SMS placeholders reserved
 
 ## Local Setup
 
@@ -89,6 +91,22 @@ Run frontend:
 npm run dev:web
 ```
 
+## Docker Compose
+
+Run the backend API and MongoDB together:
+
+```bash
+docker compose up --build
+```
+
+The API will be available at `http://localhost:8080` and MongoDB at `mongodb://localhost:27017`.
+
+To stop the stack:
+
+```bash
+docker compose down
+```
+
 ## Core Flow
 
 1. Demo site loads `/tracker/:domainId.js`.
@@ -99,8 +117,9 @@ npm run dev:web
 6. Dashboard creates a tracked email through `/emails/send`.
 7. Email opens hit `/email/open/:trackingId.gif`.
 8. Email clicks redirect through `/email/click/:trackingId`.
-9. LangGraph agents analyze signals and create engagement queue items in a later phase.
-10. Dashboard can now inspect run queue items, policy decisions, and decision traces through the Phase 5 APIs.
+9. Auto-engagement runs can enroll one or many contacts and process them in batches.
+10. Queue workers send eligible items automatically in full-autonomy mode and retry transient failures.
+11. Dashboard can inspect run contacts, queue items, policy decisions, traces, and notifications through the backend APIs.
 
 ## Phase 2 Endpoints
 
@@ -124,12 +143,15 @@ POST /engagement/runs
 GET  /engagement/runs
 GET  /engagement/runs/:runId
 PATCH /engagement/runs/:runId
+GET  /engagement/runs/:runId/contacts
+POST /engagement/runs/:runId/process
 GET  /engagement/runs/:runId/queue
 GET  /engagement/runs/:runId/queue/:queueItemId
 POST /engagement/runs/:runId/queue/:queueItemId/approve
 POST /engagement/runs/:runId/queue/:queueItemId/pause
 POST /engagement/runs/:runId/queue/:queueItemId/generate-message
 PUT  /engagement/runs/:runId/queue/:queueItemId/message
+POST /engagement/queue/process
 GET  /engagement/runs/:runId/decision-traces
 GET  /engagement/runs/:runId/graph
 GET  /engagement/runs/:runId/notifications
